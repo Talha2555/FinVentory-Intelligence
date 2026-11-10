@@ -1,9 +1,9 @@
 import streamlit as st
-import pandas as pd
-import psycopg2
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
+
+from database import DatabaseError, fetch_frame, execute
+from auth import authenticate as verify_credentials, AuthenticationError
 
 # ==========================================
 # 1. CONFIGURATION & STATE
@@ -17,64 +17,28 @@ if "logged_in" not in st.session_state:
 # ==========================================
 # 2. DATABASE CONNECTION
 # ==========================================
-DB_HOST = "localhost"
-DB_NAME = "finventory_db"
-DB_USER = "postgres"
-DB_PASS = "your_local_password_here"  # Your password
-DB_PORT = "5432"
-
-
-@st.cache_resource
-def get_connection():
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASS,
-            port=DB_PORT
-        )
-        return conn
-    except Exception as e:
-        st.error(f"Database connection failed: {e}")
-        return None
-
-
 def fetch_data(query):
-    conn = get_connection()
-    if conn:
-        df = pd.read_sql(query, conn)
-        return df
-    return pd.DataFrame()
+    try:
+        return fetch_frame(query)
+    except DatabaseError:
+        st.error("Database request failed. Check database setup and server logs.")
+        st.stop()
 
 
-# Function for executing updates (like the Alert Trigger)
 def execute_query(query):
-    conn = get_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            cur.execute(query)
-            conn.commit()
-            cur.close()
-            return True
-        except Exception as e:
-            st.error(f"Query execution failed: {e}")
-            return False
+    try:
+        execute(query)
+        return True
+    except DatabaseError:
+        st.error("Database update failed. No changes were committed. Check server logs.")
+        return False
 
 
-# ==========================================
-# 3. AUTHENTICATION (CSV)
-# ==========================================
 def authenticate(username, password):
     try:
-        users_df = pd.read_csv("users.csv")
-        match = users_df[(users_df['username'] == username) & (users_df['password'] == password)]
-        if not match.empty:
-            return match.iloc[0]['role']
-        return None
-    except FileNotFoundError:
-        st.error("Error: users.csv file not found.")
+        return verify_credentials(username, password)
+    except AuthenticationError:
+        st.error("Authentication is unavailable. Check the configured users file.")
         return None
 
 
@@ -141,17 +105,18 @@ else:
 
         # Monthly Sales Trend
         st.subheader("Revenue Trend Over Time")
-        df_sales = fetch_data("SELECT * FROM monthly_sales_view;")
+        df_sales = fetch_data("SELECT * FROM monthly_sales_view ORDER BY month;")
         if not df_sales.empty:
             fig, ax = plt.subplots(figsize=(10, 3))
             sns.lineplot(data=df_sales, x='month', y='revenue', marker='o', color='#2E86C1', ax=ax)
             plt.xticks(rotation=45)
             st.pyplot(fig)
+            plt.close(fig)
 
     # --- PAGE: AI DEMAND PREDICTIONS ---
     elif choice == "AI Demand Predictions":
         st.title("🤖 AI-Weighted Demand Forecast")
-        st.write("Using a weighted algorithm (50% current, 30% prev, 20% prev-2) to forecast upcoming inventory needs.")
+        st.write("Using a weighted algorithm (50% latest completed month, 30% previous month, 20% two months earlier) to forecast upcoming inventory needs.")
 
         df_predict = fetch_data("SELECT * FROM demand_prediction_view ORDER BY predicted_sales DESC;")
 
@@ -159,15 +124,16 @@ else:
             col1, col2 = st.columns([2, 3])
 
             with col1:
-                st.dataframe(df_predict, use_container_width=True, hide_index=True)
+                st.dataframe(df_predict, width='stretch', hide_index=True)
 
             with col2:
                 fig, ax = plt.subplots(figsize=(8, 5))
-                sns.barplot(data=df_predict, y='name', x='predicted_sales', palette='viridis', ax=ax)
+                sns.barplot(data=df_predict, y='name', x='predicted_sales', hue='name', palette='viridis', legend=False, ax=ax)
                 ax.set_title("Forecasted Unit Sales by Product")
                 ax.set_xlabel("Predicted Units Needed")
                 ax.set_ylabel("")
                 st.pyplot(fig)
+                plt.close(fig)
         else:
             st.info("Insufficient historical data to generate AI predictions.")
 
@@ -188,7 +154,7 @@ else:
 
         df_inventory = fetch_data("SELECT * FROM inventory_status_view;")
         if not df_inventory.empty:
-            st.dataframe(df_inventory, use_container_width=True)
+            st.dataframe(df_inventory, width='stretch')
 
         st.divider()
 
@@ -229,11 +195,11 @@ else:
                 unsafe_allow_html=True)
 
             st.subheader("Financial Distribution")
-            sizes = [df_profit['gross_profit'].iloc[0], df_profit['total_cost'].iloc[0],
+            sizes = [df_profit['net_profit'].iloc[0], df_profit['total_cost'].iloc[0],
                      df_profit['total_expenses'].iloc[0]]
             # Filter out negative or zero values for the pie chart
-            labels = ['Gross Profit', 'COGS (Cost of Goods)', 'Expenses']
-            valid_sizes = [s for s in sizes if s > 0]
+            labels = ['Net Profit', 'COGS (Cost of Goods)', 'Expenses']
+            valid_sizes = [float(s) for s in sizes if s > 0]
             valid_labels = [l for s, l in zip(sizes, labels) if s > 0]
 
             if valid_sizes:
@@ -242,13 +208,14 @@ else:
                        colors=['#2ecc71', '#e74c3c', '#f1c40f'])
                 ax.axis('equal')
                 st.pyplot(fig)
+                plt.close(fig)
         else:
             st.info("No financial data available.")
 
     # --- PAGE: TRANSACTIONS (ADMIN ONLY) ---
     elif choice == "Transactions":
         st.title("🔄 Full Transaction Ledger")
-        st.write("All auto-recorded sales and purchases via trigger integration.")
+        st.write("Recorded sales and purchases from the transaction ledger.")
 
         query = """
         SELECT 
@@ -263,4 +230,4 @@ else:
         ORDER BY t.transaction_date DESC LIMIT 100;
         """
         df_trans = fetch_data(query)
-        st.dataframe(df_trans, use_container_width=True)
+        st.dataframe(df_trans, width='stretch')
