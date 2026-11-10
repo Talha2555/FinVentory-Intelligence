@@ -1,7 +1,8 @@
 -- =========================================
 -- 1. CREATE DATABASE
 -- =========================================
-CREATE DATABASE finventory_db;
+-- Create the database separately; execute this file inside the target database.
+BEGIN;
 
 -- Connect to DB (run separately in psql)
 -- \c finventory_db;
@@ -58,6 +59,7 @@ CREATE TABLE sales_items (
     product_id INT,
     quantity INT NOT NULL,
     price NUMERIC(10,2) NOT NULL,
+    unit_cost NUMERIC(10,2) NOT NULL,
 
     FOREIGN KEY (sale_id)
     REFERENCES sales(sale_id)
@@ -155,7 +157,7 @@ CREATE TABLE roles (
 CREATE TABLE users (
     user_id SERIAL PRIMARY KEY,
     username VARCHAR(50) UNIQUE NOT NULL,
-    password TEXT NOT NULL,
+    password_hash TEXT NOT NULL, -- reserved; Streamlit uses the private hashed CSV
     role_id INT,
 
     FOREIGN KEY (role_id)
@@ -206,7 +208,10 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION check_low_stock()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.quantity < NEW.reorder_level THEN
+    IF NEW.quantity < NEW.reorder_level AND NOT EXISTS (
+        SELECT 1 FROM alerts WHERE alert_type = 'LOW_STOCK' AND status = 'UNREAD'
+        AND message = 'Low stock for product ID: ' || NEW.product_id
+    ) THEN
         INSERT INTO alerts (message, alert_type)
         VALUES ('Low stock for product ID: ' || NEW.product_id, 'LOW_STOCK');
     END IF;
@@ -237,12 +242,16 @@ DECLARE current_qty INT;
 BEGIN
     SELECT quantity INTO current_qty
     FROM inventory
-    WHERE product_id = NEW.product_id;
+    WHERE product_id = NEW.product_id
+    FOR UPDATE;
 
-    IF current_qty < NEW.quantity THEN
+    IF current_qty IS NULL OR current_qty < NEW.quantity THEN
         RAISE EXCEPTION 'Not enough stock!';
     END IF;
 
+    IF NEW.unit_cost IS NULL THEN
+        SELECT cost_price INTO NEW.unit_cost FROM products WHERE product_id = NEW.product_id;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -286,15 +295,6 @@ EXECUTE FUNCTION prevent_negative_stock();
 -- 16. VIEWS (FOR DASHBOARD)
 -- =========================================
 
--- Monthly Sales
-CREATE VIEW monthly_sales_view AS
-SELECT 
-    DATE_TRUNC('month', sale_date) AS month,
-    SUM(total_amount) AS revenue
-FROM sales
-GROUP BY month;
-
-
 -- Inventory Status
 CREATE VIEW inventory_status_view AS
 SELECT 
@@ -318,14 +318,6 @@ SELECT
 FROM sales_items si
 JOIN products p ON si.product_id = p.product_id
 GROUP BY p.name;
-
-
--- Profit Summary
-CREATE VIEW profit_summary AS
-SELECT 
-    (SELECT SUM(total_amount) FROM sales) AS total_revenue,
-    (SELECT SUM(total_cost) FROM purchases) AS total_cost,
-    (SELECT SUM(amount) FROM expenses) AS total_expenses;
 
 
 -- =========================================
@@ -412,88 +404,5 @@ BEGIN
 END;
 $$;
 
--- =========================================================
--- 1. INSERT TECH PRODUCTS
--- =========================================================
-INSERT INTO products (name, category, cost_price, selling_price) VALUES
-('iPhone 15 Pro (256GB)', 'Mobile', 280000.00, 315000.00),
-('Samsung Galaxy S24 Ultra', 'Mobile', 310000.00, 345000.00),
-('MacBook Air M3 (16GB/512GB)', 'Laptop', 350000.00, 395000.00),
-('Dell XPS 15', 'Laptop', 420000.00, 460000.00),
-('Apple AirPods Pro 2', 'Accessories', 65000.00, 75000.00),
-('Anker 65W GaN Charger', 'Accessories', 12000.00, 16000.00);
-
--- =========================================================
--- 2. INITIALIZE INVENTORY
--- Setting the base stock so triggers don't block sales
--- =========================================================
-INSERT INTO inventory (product_id, quantity, reorder_level) VALUES
-(1, 15, 5),   -- iPhones
-(2, 12, 4),   -- Samsungs
-(3, 8,  2),   -- MacBooks
-(4, 5,  2),   -- Dell XPS
-(5, 30, 10),  -- AirPods
-(6, 45, 15);  -- Chargers
-
--- =========================================================
--- 3. INSERT SUPPLIERS & RETAILERS
--- =========================================================
-INSERT INTO suppliers (name, contact, address) VALUES
-('TechBridge Distributions', '0300-1112223', 'I.I Chundrigar Road'),
-('Global Silicon Importers', '0321-4445556', 'Saddar Electronics Market');
-
-INSERT INTO retailers (name, contact, address) VALUES
-('Walk-in Customer', 'N/A', 'N/A'),
-('Corporate Client XYZ', '0333-7778889', 'Tech Park, Shahrah-e-Faisal');
-
--- =========================================================
--- 4. RECORD PURCHASES (Restocking)
--- =========================================================
-INSERT INTO purchases (purchase_date, supplier, total_cost) VALUES
-('2026-04-01', 'TechBridge Distributions', 1400000.00),
-('2026-04-10', 'Global Silicon Importers', 2100000.00);
-
--- Insert Purchase Items (Triggers will ADD to inventory)
-INSERT INTO purchase_items (purchase_id, product_id, quantity, cost) VALUES
-(1, 1, 5, 280000.00), -- Restocked 5 iPhones
-(2, 3, 6, 350000.00); -- Restocked 6 MacBooks
-
--- =========================================================
--- 5. RECORD SALES (Revenue)
--- =========================================================
-INSERT INTO sales (sale_date, total_amount) VALUES
-('2026-04-12', 390000.00),
-('2026-04-18', 1185000.00),
-('2026-04-25', 16000.00);
-
--- Insert Sales Items (Triggers will SUBTRACT from inventory)
-INSERT INTO sales_items (sale_id, product_id, quantity, price) VALUES
-(1, 1, 1, 315000.00), -- Sold 1 iPhone
-(1, 5, 1, 75000.00),  -- Sold 1 AirPods Pro
-(2, 3, 3, 395000.00), -- Sold 3 MacBooks (Corporate Order)
-(3, 6, 1, 16000.00);  -- Sold 1 Charger
-
--- =========================================================
--- 6. RECORD EXPENSES
--- =========================================================
-INSERT INTO expenses (expense_type, amount, expense_date) VALUES
-('Shop Rent', 120000.00, '2026-04-01'),
-('Electricity & Internet', 45000.00, '2026-04-05'),
-('Software Subscriptions', 15000.00, '2026-04-15');
-CALL record_sale_transaction(1, 2, 5000);
-
-CALL record_purchase_transaction(3, 1, 8000);
-
-SELECT * FROM transactions;
-
-SELECT * FROM transactions
-WHERE transaction_type = 'SALE';
-
-SELECT * FROM transactions
-WHERE transaction_type = 'PURCHASE';
-
-SELECT 
-    transaction_type,
-    SUM(amount) AS total_amount
-FROM transactions
-GROUP BY transaction_type;
+\ir views.sql
+COMMIT;
